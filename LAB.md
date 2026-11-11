@@ -2,9 +2,15 @@
 
 ## The situation
 
-Clippy runs on one server. During the launch of a big customer's campaign the server ran out of memory, restarted and was gone for four minutes. Every short link in the campaign returned an error, in front of the customer's whole audience.
+*The Clippy Dispatch, Black Friday edition. A newsletter for people who keep the short links alive.*
 
-You will build the standard answer: an **Application Load Balancer** in front of an **Auto Scaling group** of two servers in two availability zones. If one server dies, the balancer stops sending it traffic within seconds and the group starts a replacement by itself. Then you will prove it by killing a server **on purpose** while you watch the URL.
+Hello, and welcome. This week's story is a true one, with the names changed to protect the embarrassed.
+
+A big retail customer launched its Black Friday campaign. Every poster, every e-mail and every screen in forty shops carried a Clippy short link. At 08:02 the single server that Clippy lived on ran out of memory, restarted, and was gone for four minutes. Four minutes does not sound like much. It is, if you count it in *customers standing in front of a QR code that says "error"*.
+
+(An aside, because every good newsletter has one: the server was not even busy. It had been running for 214 days and nobody had restarted it since the last time someone said "we should restart it". Servers have feelings too.)
+
+The fix is the oldest trick in the book, and today you build it with your own hands: an **Application Load Balancer** in front of an **Auto Scaling group** of two servers in two availability zones. If one server dies, the balancer stops sending it traffic within seconds, and the group starts a replacement by itself. Then comes the fun part: you kill a server **on purpose** while you watch the URL, and read what happens, second by second.
 
 > **Your mission**
 > - Build the chain: security groups, launch template, target group, load balancer, Auto Scaling group, scaling policy
@@ -12,20 +18,29 @@ You will build the standard answer: an **Application Load Balancer** in front of
 > - Terminate a server while you hammer the URL, and read what happens
 > - Tear it down (a load balancer bills every hour) and prove it
 
-**Time:** 90-105 min | **Cost:** a few cents (a load balancer and two small servers for about an hour) | **You need:** an AWS administrator user, the AWS CLI v2 configured for it, Python 3, curl and a terminal. The lab uses your default VPC.
+**Time:** 105-120 min | **Cost:** a few cents (a load balancer and two small servers for about an hour) | **You need:** an AWS administrator user, the AWS CLI v2 configured for it, Python 3, curl and a terminal. The lab uses your default VPC.
 
 ---
 
-## Part 0 - Look before you build
+## Part 0 - Before you build: the map
 
-1. **Fork** this repository and clone it. `userdata.sh` is the script every new server runs on its first boot: it installs Clippy and sets its `APP_VERSION` to the **instance id**. That means `curl <url>/healthz` tells you *which server answered*.
-2. In the console, open **EC2 → Load Balancers** and **EC2 → Auto Scaling Groups** to see the screens you will fill in. You will do the work in the console first and write the CLI commands in `notes.md` as you go.
+A load balancer feels like one box. It is really three ideas that work together, and most "it does not work" moments come from mixing them up:
+
+- the **listener** accepts a request (port 80 here) and decides what to do with it;
+- the **target group** is the list of servers, with a **health check** that decides which of them deserve traffic;
+- the **Auto Scaling group** *owns* the servers: it creates them, replaces them and adds more when they sweat.
+
+Who watches whom? The balancer watches the servers (health checks). The group watches the balancer's opinion (health check type **ELB**) and replaces whoever it says is unhealthy. Hold on to that sentence, it comes back in Part 5.
+
+Now the practical part. **Fork** this repository and clone it. `userdata.sh` is the script every new server runs on its first boot: it installs Clippy and sets its `APP_VERSION` to the **instance id**. That means `curl <url>/healthz` tells you *which server answered*. In the console, open **EC2 → Load Balancers** and **EC2 → Auto Scaling Groups** to see the screens you will fill in. You will do the work in the console first and write the CLI commands in `notes.md` as you go.
+
+> **Predict** Two servers, one load balancer. You send 10 requests in a row and print the `version` of each answer. What do you expect to see: all the same, alternating, or random? Write it down now, you will check in Part 4.
 
 > **Think** The servers have no public address in your design (only the load balancer is reachable). Yet they must download packages from the internet at boot. In the default VPC they do have public IPs; in a real VPC what would give them internet access, and what would that cost?
 
 ---
 
-## Part 1 - Two security groups
+## Part 1 - Two security groups: who may knock on which door
 
 Create two security groups in the default VPC, both tagged `lab = aws-alb-asg`:
 
@@ -34,11 +49,13 @@ Create two security groups in the default VPC, both tagged `lab = aws-alb-asg`:
 | `clippy-alb` | port 80 from `0.0.0.0/0` |
 | `clippy-web` | port 80 **from the security group `clippy-alb`** (not from a CIDR) |
 
+> **Predict** After this lab, you find a server's public IP and run `curl http://<that-ip>`. Does it answer? Why, or why not? Test it at the end of Part 4.
+
 > **Think** Why does the second rule name a *security group* as the source? What stops somebody from calling a server directly if they discover its public IP?
 
 ---
 
-## Part 2 - Launch template and target group
+## Part 2 - Launch template and target group: the recipe and the guest list
 
 1. **Launch template** `clippy-web`: Ubuntu 24.04 (the AMI id comes from the public parameter `/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id`), `t3.micro`, security group `clippy-web`, **IMDSv2 required**, the contents of `userdata.sh` as user data, and the instance tags `lab = aws-alb-asg` and `Name = clippy-web`.
 2. **Target group** `clippy-web`: HTTP port 80 in the default VPC, health check path `/healthz`, interval 10 seconds, healthy threshold 2, unhealthy threshold 2, timeout 5.
@@ -47,13 +64,15 @@ Create two security groups in the default VPC, both tagged `lab = aws-alb-asg`:
 
 ---
 
-## Part 3 - The load balancer
+## Part 3 - The load balancer: the front door
 
 Create an **Application Load Balancer** `clippy-alb`: internet-facing, security group `clippy-alb`, **one public subnet in each of at least two availability zones**, and a listener on port 80 that forwards to the target group. Note its DNS name.
 
+> **Predict** The balancer exists, but the target group is empty. What does `curl http://<dns-name>` return right now? (Try it. Reading an error message you predicted is a small pleasure.)
+
 ---
 
-## Part 4 - The Auto Scaling group
+## Part 4 - The Auto Scaling group: the team that replaces itself
 
 Create the group `clippy-web` from the launch template:
 
@@ -71,13 +90,15 @@ DNS=$(aws elbv2 describe-load-balancers --names clippy-alb --query 'LoadBalancer
 for i in 1 2 3 4 5 6; do curl -s http://$DNS/healthz; echo; done
 ```
 
-The `version` field changes: the balancer is spreading requests over two servers.
+The `version` field changes: the balancer is spreading requests over two servers. Compare with your prediction from Part 0, and try the direct-IP `curl` from Part 1 now.
 
 > **Think** Why 300 seconds of grace? Find out for yourself: what happens to a server that needs four minutes to install Clippy if the grace period is 120 seconds and the health check type is ELB? (If you see a server being terminated and relaunched in a loop, you found it.)
 
 ---
 
-## Part 5 - Kill a server on purpose
+## Part 5 - The main event: kill a server on purpose
+
+<!-- gif: recon -->
 
 In one terminal, hit the URL five times a second:
 
@@ -85,7 +106,9 @@ In one terminal, hit the URL five times a second:
 while true; do for i in 1 2 3 4 5; do curl -s -o /dev/null -m 3 -w '%{http_code} ' http://$DNS/healthz; done; date +%T; sleep 1; done
 ```
 
-In another, terminate one of the servers (console, or `aws ec2 terminate-instances`). Watch the first terminal and then the group's activity:
+> **Predict** You are about to terminate one of two servers. Before you do, write down: will you see errors? For how many seconds? What will the *first* error code be, `502`, `503` or `000`?
+
+In another terminal, terminate one of the servers (console, or `aws ec2 terminate-instances`). Watch the first terminal and then the group's activity:
 
 ```bash
 aws autoscaling describe-scaling-activities --auto-scaling-group-name clippy-web --max-items 5 --query 'Activities[].[Description,Cause]' --output text
@@ -94,6 +117,8 @@ aws autoscaling describe-scaling-activities --auto-scaling-group-name clippy-web
 You will probably see a few errors (`502` or `000`) for several seconds, then only `200`, then, a few minutes later, a replacement joins.
 
 > **Think** Why were there errors at all? Multiply the health check interval by the unhealthy threshold: that is how long the balancer keeps sending traffic to a dead server. How would you shrink that window, and what would you pay for it (more health check traffic, more false alarms)?
+
+Here is the part the newsletter likes best. Look at your own timeline and fill in four numbers in `notes.md`: when you terminated the server, when the first error appeared, when the last error appeared, and when the replacement became `healthy`. Three delays add up (the balancer notices, the group reacts, the new server boots), and none of them is zero.
 
 ---
 
@@ -115,6 +140,8 @@ It reads the real load balancer, target group, group, policies and security grou
 - Add an HTTPS listener with a certificate from ACM and redirect port 80 to it.
 - Replace the launch template user data with a pre-baked image (an AMI) and compare the time to replace a server.
 - Turn on access logs for the load balancer to an S3 bucket and find your own `curl` in them.
+
+*That is the issue. Next week: what to do when the load balancer is the thing that dies. (Spoiler: you do not ask it nicely.)*
 
 <!-- teardown:start (generated by labs.py, do not edit) -->
 ## Tear down (mandatory)
